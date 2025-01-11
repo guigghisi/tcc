@@ -118,6 +118,7 @@ class _MainScreenState extends State<MainScreen> {
           onPressed: () {
             widget.device.disconnect();
             Navigator.pop(context);
+            Navigator.pop(context);
           },
         ),
         actions: [
