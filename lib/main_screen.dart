@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
@@ -11,35 +13,38 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> {
-  // Característica que vamos usar para enviar comandos
   BluetoothCharacteristic? targetCharacteristic;
 
-  // Nome da característica (UUID) que você definiu no ESP32
   static const String characteristicUuid =
       "87654321-4321-4321-4321-0987654321ba";
 
-  // Nome do serviço (UUID) que você definiu no ESP32
-  static const String serviceUuid = "12345678-1234-1234-1234-1234567890ab";
+  static const String serviceUuid =
+      "12345678-1234-1234-1234-1234567890ab";
 
-  // Itens que aparecem no Grid
   final List<String> items = [
     'rele 1',
     'rele 2',
     'rele 3',
     'rele 4',
     'rele 5',
-    'rele 6'
+    'rele 6',
   ];
 
-  // Comandos de exemplo (você pode mudar esses valores)
+  List<bool> relayStates = [false, false, false, false, false, false];
+
   final List<List<int>> commands = [
-    [0x12, 0x34],
-    [0x56, 0x78],
-    [0x9A, 0xBC],
-    [0xDE, 0xF0],
-    [0x12, 0x34],
-    [0x56, 0x78],
+    [0x1],
+    [0x2],
+    [0x3],
+    [0x4],
+    [0x5],
+    [0x6],
   ];
+
+  bool _servicesDiscovered = false;
+
+  // StreamSubscription para cancelar quando sair da tela
+  StreamSubscription<List<int>>? _notifySubscription;
 
   @override
   void initState() {
@@ -47,51 +52,103 @@ class _MainScreenState extends State<MainScreen> {
     _initBleConnection();
   }
 
-  /// 1) Conecta ao dispositivo e descobre as características
   Future<void> _initBleConnection() async {
     try {
-      // Garante que estamos conectados antes de descobrir os serviços
-      await widget.device.connect(autoConnect: false);
-      print("Dispositivo conectado!");
-
-      // Descobre serviços e características
-      final services = await widget.device.discoverServices();
-      for (final service in services) {
-        // Verifica se este é o serviço que queremos
-        if (service.uuid.toString().toUpperCase() ==
-            serviceUuid.toUpperCase()) {
-          for (final characteristic in service.characteristics) {
-            // Verifica se é a característica que queremos
-            if (characteristic.uuid.toString().toUpperCase() ==
-                characteristicUuid.toUpperCase()) {
-              setState(() {
-                targetCharacteristic = characteristic;
-              });
-              print("Encontrou a característica: ${characteristic.uuid}");
-              break;
-            }
-          }
-        }
+      final state = await widget.device.state.first;
+      if (state != BluetoothDeviceState.connected) {
+        await widget.device.connect(autoConnect: false);
+        print("Dispositivo conectado!");
+      } else {
+        print("Dispositivo já estava conectado!");
       }
 
-      if (targetCharacteristic == null) {
-        print("Não encontrou a característica que estávamos procurando!");
+      if (!_servicesDiscovered) {
+        _servicesDiscovered = true;
+        await _discoverServices();
       }
     } catch (e) {
       print("Erro ao conectar e descobrir serviços/características: $e");
     }
   }
 
+  Future<void> _discoverServices() async {
+    final services = await widget.device.discoverServices();
+    for (final service in services) {
+      if (service.uuid.toString().toUpperCase() == serviceUuid.toUpperCase()) {
+        for (final characteristic in service.characteristics) {
+          if (characteristic.uuid.toString().toUpperCase() ==
+              characteristicUuid.toUpperCase()) {
+            setState(() {
+              targetCharacteristic = characteristic;
+            });
+            print("Encontrou a característica: ${characteristic.uuid}");
+
+            if (characteristic.properties.notify) {
+              await characteristic.setNotifyValue(true);
+
+              // Cancela se já houver assinatura anterior (boa prática)
+              await _notifySubscription?.cancel();
+
+              // Armazena a nova assinatura
+              _notifySubscription = characteristic.value.listen((value) {
+                // Se quiser, cheque se 'mounted' == true antes de setState()
+                if (!mounted) return;
+
+                final receivedString = String.fromCharCodes(value);
+                print("Recebeu notificação: $receivedString");
+                _updateRelayStates(receivedString);
+              });
+            }
+
+            if (characteristic.properties.read) {
+              final initialValue = await characteristic.read();
+              final initialString = String.fromCharCodes(initialValue);
+              print("Valor inicial: $initialString");
+              _updateRelayStates(initialString);
+            }
+
+            break;
+          }
+        }
+      }
+    }
+
+    if (targetCharacteristic == null) {
+      print("Não encontrou a característica que estávamos procurando!");
+    }
+  }
+
+  void _updateRelayStates(String binaryStates) {
+    // Se o widget já estiver desmontado, não faz nada
+    if (!mounted) return;
+
+    if (binaryStates.length < 6) return; // Evita erro se a string for menor
+
+    List<bool> newStates = List.generate(6, (index) {
+      return binaryStates[index] == '1';
+    });
+
+    setState(() {
+      relayStates = newStates;
+    });
+  }
+
   @override
   void dispose() {
-    // Quando sair da tela, desconecta o dispositivo para liberar recursos
-    widget.device.disconnect();
+    // Cancela a assinatura de notificação
+    _notifySubscription?.cancel();
+
+    // Se quiser desligar o dispositivo ao sair, faça aqui
+    try {
+      widget.device.disconnect();
+    } catch (e) {
+      print("Erro ao desconectar (dispose): $e");
+    }
+    
     super.dispose();
   }
 
-  /// 2) Envia o comando selecionado via BLE
   Future<void> _sendCommand(int index) async {
-    // Verifica se temos a característica alvo
     if (targetCharacteristic == null) {
       print("Característica BLE não encontrada ou não inicializada.");
       return;
@@ -100,7 +157,7 @@ class _MainScreenState extends State<MainScreen> {
     try {
       await targetCharacteristic!.write(
         commands[index],
-        withoutResponse: false, // ou true se o seu ESP32 usar Write Without Response
+        withoutResponse: false,
       );
       print("Comando enviado: ${commands[index]}");
     } catch (e) {
@@ -116,8 +173,7 @@ class _MainScreenState extends State<MainScreen> {
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
           onPressed: () {
-            widget.device.disconnect();
-            Navigator.pop(context);
+            // Só sai da tela; o disconnect ocorre no dispose()
             Navigator.pop(context);
           },
         ),
@@ -125,7 +181,7 @@ class _MainScreenState extends State<MainScreen> {
           IconButton(
             icon: const Icon(Icons.bluetooth_disabled),
             onPressed: () {
-              widget.device.disconnect();
+              // Também só sai da tela
               Navigator.pop(context);
             },
           ),
@@ -137,16 +193,19 @@ class _MainScreenState extends State<MainScreen> {
           crossAxisCount: 2,
         ),
         itemBuilder: (context, index) {
+          final isOn = relayStates[index];
           return GestureDetector(
             onTap: () {
               _sendCommand(index);
             },
             child: Card(
+              color: isOn ? Colors.lightGreen : Colors.redAccent,
               margin: const EdgeInsets.all(8.0),
               child: Center(
                 child: Text(
-                  items[index],
-                  style: const TextStyle(fontSize: 18),
+                  "${items[index]}\n${isOn ? 'Ligado' : 'Desligado'}",
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 18, color: Colors.white),
                 ),
               ),
             ),
